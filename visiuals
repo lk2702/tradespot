@@ -1,0 +1,1560 @@
+"""
+Baustein 3: Backtest der Auffälligkeiten aus scan.py.
+
+Frage: Hatten die Auffälligkeiten in den letzten Jahren einen Vorsprung
+gegenüber einem beliebigen Tag, auch nach Abzug von Handelskosten?
+
+Ablauf je Auffälligkeit, getrennt nach Aktien / Krypto / Rohstoffe:
+- Signal entsteht am Tagesschluss, Einstieg zum Eröffnungskurs des Folgetags
+  (kein Blick in die Zukunft).
+- Ausstieg nach 1, 3 oder 5 Handelstagen zum Schlusskurs.
+- Kosten pro Trade (Gebühr + Spread + Slippage) werden abgezogen.
+- Vergleich mit dem Durchschnitt ALLER Tage derselben Gruppe (Basis).
+- Die t-Werte fassen Ereignisse desselben Tages zusammen, damit ein einzelner
+  Crash mit 9 betroffenen Coins nicht 9-mal zählt.
+- Stabilitätscheck: Der Vorsprung wird für die erste und die zweite
+  Zeithälfte getrennt gezeigt. Echte Vorteile sollten in beiden sichtbar sein.
+
+Aufruf:   python backtest.py
+
+GRENZEN (bitte ernst nehmen):
+- Überlebensverzerrung: Das Universum besteht aus HEUTIGEN Index-Mitgliedern und
+  heutigen Top-Coins. Pleitegegangene oder aussortierte Werte fehlen, das macht
+  Ergebnisse tendenziell zu gut. Der Vergleich mit der Basis mildert das ab.
+- Viele Tests auf einmal: Einige Treffer entstehen allein durch Zufall. Deshalb
+  zählt nur, was streng bestanden wird (siehe STRENG_T und beide Hälften).
+- Kostenannahmen sind grob. Leihkosten für Leerverkäufe von Aktien sind nicht
+  enthalten. Positionsgrößen sind nicht berücksichtigt.
+- Vergangenheit garantiert nichts für die Zukunft.
+
+Lernprojekt, keine Anlageberatung.
+"""
+from datetime import date
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+from daten_basis import verbinde
+from scan import GAP_SCHWELLE, GAP_VOLUMEN, RSI_UEBERVERKAUFT, VOLUMEN_SPITZE
+
+HORIZONTE = [1, 3, 5]                      # Handelstage ab Einstieg
+KOSTEN = {"Aktien": 0.0010, "Krypto": 0.0020, "Rohstoffe": 0.0015}  # je Trade, Hin+Zurück
+MIN_EREIGNISSE = 30
+MIN_HAELFTE = 10
+STRENG_T = 2.5
+MIN_TAGE = 20
+
+KLASSEN = ["Aktien", "Krypto", "Rohstoffe"]
+CSV_DATEI = Path(__file__).with_name("backtest_ergebnisse.csv")
+
+# (Anzeigename, Spalte, Richtung: +1 long, -1 short)
+VARIANTEN = [
+    ("Ausbruch nach oben -> long", "oben", 1),
+    ("Überverkauft im Aufwärtstrend -> long", "ueber", 1),
+    ("Ausbruch nach unten -> short (Trend folgt)", "unten", -1),
+    ("Ausbruch nach unten -> long (Erholung)", "unten", 1),
+    ("Kurslücke nach oben, hohes Volumen -> long", "gap_auf", 1),
+    ("Kurslücke nach unten, hohes Volumen -> short", "gap_ab", -1),
+    ("Kurslücke nach unten, hohes Volumen -> long (Erholung)", "gap_ab", 1),
+]
+
+
+# ---------- Daten und Kennzahlen ----------
+def lade_kurse(con) -> tuple[pd.DataFrame, dict]:
+    kurse = pd.read_sql_query(
+        "SELECT k.ticker, k.datum, k.open, k.high, k.low, k.close, k.volume "
+        "FROM kurse k JOIN universum u ON u.ticker = k.ticker "
+        "WHERE u.liquide = 1 ORDER BY k.ticker, k.datum",
+        con, parse_dates=["datum"],
+    )
+    kurse = kurse[kurse["datum"] < pd.Timestamp(date.today())]  # nur fertige Tageskerzen
+    klasse_von = {}
+    for ticker, gruppe in con.execute("SELECT ticker, gruppe FROM universum"):
+        klasse_von[ticker] = {"KRYPTO": "Krypto", "ROHSTOFF": "Rohstoffe"}.get(gruppe, "Aktien")
+    return kurse, klasse_von
+
+
+def baue_tabelle(kurse: pd.DataFrame, klasse_von: dict) -> pd.DataFrame:
+    teile = []
+    for ticker, df in kurse.groupby("ticker"):
+        df = df.sort_values("datum").dropna(subset=["close"]).reset_index(drop=True)
+        if len(df) < 260:
+            continue
+        o, h, l, c, v = (df[x] for x in ("open", "high", "low", "close", "volume"))
+
+        delta = c.diff()
+        gewinn = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+        verlust = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+        rsi = 100 - 100 / (1 + gewinn / verlust)
+
+        hoch20 = h.shift(1).rolling(20).max()
+        tief20 = l.shift(1).rolling(20).min()
+        vs = v.shift(1).rolling(20).mean()
+        vr = v / vs.where(vs > 0)
+        sma50 = c.rolling(50).mean()
+        sma200 = c.rolling(200).mean()
+        gap = o / c.shift(1) - 1
+        gap_gross = (gap.abs() >= GAP_SCHWELLE) & (vr >= GAP_VOLUMEN)
+
+        t = pd.DataFrame({"datum": df["datum"], "ticker": ticker, "klasse": klasse_von[ticker]})
+        t["oben"] = (c > hoch20) & (vr >= VOLUMEN_SPITZE) & (c > sma50)
+        t["ueber"] = (rsi < RSI_UEBERVERKAUFT) & (c > sma200)
+        t["unten"] = (c < tief20) & (vr >= VOLUMEN_SPITZE) & (c <= sma50)
+        t["gap_auf"] = gap_gross & (gap > 0)
+        t["gap_ab"] = gap_gross & (gap < 0)
+
+        einstieg = o.shift(-1)  # Eröffnungskurs des Folgetags
+        for hz in HORIZONTE:
+            t[f"fwd{hz}"] = c.shift(-hz) / einstieg - 1
+        teile.append(t[sma200.notna()])
+    return pd.concat(teile, ignore_index=True)
+
+
+# ---------- Auswertung ----------
+def kennzahlen(g_alle, ev, col, richtung, kosten, mitte) -> dict | None:
+    ev = ev.dropna(subset=[col])
+    g = g_alle.dropna(subset=[col])
+    if len(ev) < MIN_EREIGNISSE:
+        return None
+
+    roh = richtung * ev[col]
+    netto = roh - kosten
+    basis = (richtung * g[col]).mean()
+    vorsprung = roh.mean() - basis
+
+    pro_tag = (roh - basis).groupby(ev["datum"]).mean()  # Cluster: ein Wert je Tag
+    sd = pro_tag.std(ddof=1)
+    t = pro_tag.mean() / (sd / np.sqrt(len(pro_tag))) if len(pro_tag) > 2 and sd > 0 else np.nan
+
+    def haelfte(spalte_ev, spalte_g):
+        e = ev[spalte_ev]
+        b = g[spalte_g]
+        if len(e) < MIN_HAELFTE or b.empty:
+            return np.nan
+        return richtung * e[col].mean() - (richtung * b[col]).mean()
+
+    return {
+        "n": len(ev),
+        "tage": ev["datum"].nunique(),
+        "mean_netto": netto.mean(),
+        "median_netto": netto.median(),
+        "treffer": (netto > 0).mean(),
+        "fall5": netto.quantile(0.05),
+        "vorsprung": vorsprung,
+        "t": t,
+        "v_h1": haelfte(ev["datum"] <= mitte, g["datum"] <= mitte),
+        "v_h2": haelfte(ev["datum"] > mitte, g["datum"] > mitte),
+    }
+
+
+def analysiere(alle: pd.DataFrame) -> pd.DataFrame:
+    mitte = alle["datum"].sort_values().iloc[len(alle) // 2]
+    zeilen = []
+    for klasse in KLASSEN:
+        teil = alle[alle["klasse"] == klasse]
+        if teil.empty:
+            continue
+        for name, spalte, richtung in VARIANTEN:
+            ev = teil[teil[spalte]]
+            for hz in HORIZONTE:
+                k = kennzahlen(teil, ev, f"fwd{hz}", richtung, KOSTEN[klasse], mitte)
+                if k:
+                    zeilen.append({"klasse": klasse, "variante": name, "h": hz, **k})
+    return pd.DataFrame(zeilen)
+
+
+def streng_bestanden(z) -> bool:
+    return bool(
+        z["n"] >= MIN_EREIGNISSE and z["tage"] >= MIN_TAGE
+        and z["mean_netto"] > 0 and z["vorsprung"] > 0
+        and z["t"] >= STRENG_T and z["v_h1"] > 0 and z["v_h2"] > 0
+    )
+
+
+def zeige(erg: pd.DataFrame, alle: pd.DataFrame) -> None:
+    print(f"Zeitraum: {alle['datum'].min().date()} bis {alle['datum'].max().date()} | "
+          f"Werte: {alle['ticker'].nunique()} | Tageszeilen: {len(alle):,}".replace(",", "."))
+    for klasse in KLASSEN:
+        teil = erg[erg["klasse"] == klasse] if not erg.empty else erg
+        if teil.empty:
+            print(f"\n=== {klasse}: zu wenige Ereignisse für eine Aussage ===")
+            continue
+        print(f"\n=== {klasse} (angenommene Kosten {KOSTEN[klasse]:.2%} pro Trade) ===")
+        for name, grp in teil.groupby("variante", sort=False):
+            print(f"\n{name}")
+            print("  Halte  Ereign.  Tage  Ø netto  Median  Treffer  5%-Fall  Vorsprung     t  1.Hälfte  2.Hälfte")
+            for _, z in grp.iterrows():
+                print(f"  {z['h']:>2} T  {z['n']:>7} {z['tage']:>5} {z['mean_netto']:>8.2%} "
+                      f"{z['median_netto']:>7.2%} {z['treffer']:>7.0%} {z['fall5']:>8.2%} "
+                      f"{z['vorsprung']:>9.2%} {z['t']:>5.1f} {z['v_h1']:>8.2%} {z['v_h2']:>8.2%}")
+
+    print("\n" + "=" * 60)
+    print("Strenger Test (Ø netto > 0, Vorsprung > 0, t >= "
+          f"{STRENG_T}, in BEIDEN Zeithälften positiv):")
+    if erg.empty:
+        print("  Keine auswertbaren Ergebnisse.")
+        return
+    bestanden = erg[erg.apply(streng_bestanden, axis=1)]
+    if bestanden.empty:
+        print("  Keine Variante besteht den Test. Das ist ein ehrliches Ergebnis:\n"
+              "  Die Auffälligkeiten allein hatten hier keinen verlässlichen Vorsprung.")
+    else:
+        for _, z in bestanden.iterrows():
+            print(f"  {z['klasse']}: {z['variante']}, Haltedauer {z['h']} T "
+                  f"(Vorsprung {z['vorsprung']:+.2%}, t {z['t']:.1f}, n {z['n']})")
+        print("  Auch das ist nur ein Hinweis, kein Beweis (Zufall, Überlebensverzerrung).")
+
+
+def main() -> None:
+    con = verbinde()
+    kurse, klasse_von = lade_kurse(con)
+    con.close()
+    print("Berechne Kennzahlen für alle Werte ...")
+    alle = baue_tabelle(kurse, klasse_von)
+    erg = analysiere(alle)
+    zeige(erg, alle)
+    if not erg.empty:
+        erg.to_csv(CSV_DATEI, index=False, sep=";", decimal=",", encoding="utf-8-sig")
+        print(f"\nGespeichert: {CSV_DATEI.name}. Keine Anlageberatung.")
+
+
+if __name__ == "__main__":
+    main()
+
+"""
+Baustein 1: Universum und lokale Kursdatenbank (kostenlos, nur Tagesdaten).
+
+Installation:  pip install yfinance pandas lxml
+
+Befehle:
+    python daten_basis.py init     Universum aufbauen + erste Kursdaten laden
+    python daten_basis.py update   neue Kurse nachladen (am besten nach Börsenschluss)
+    python daten_basis.py status   Überblick über die Datenbank
+
+Die Daten landen in kurse.db (im selben Ordner). Spätere Bausteine lesen
+von dort, statt jedes Mal alles neu zu laden.
+
+Hinweise:
+- Ein Tageskerzen-Eintrag von heute kann unvollständig sein, solange die Börse
+  offen ist. Beim nächsten update wird er automatisch überschrieben.
+- Datenquelle yfinance ist kostenlos, aber inoffiziell und kann Lücken haben.
+
+Lernprojekt, keine Anlageberatung.
+"""
+import io
+import sqlite3
+import ssl
+import sys
+import time
+import urllib.request
+from datetime import date, timedelta
+from pathlib import Path
+
+import certifi
+import pandas as pd
+import yfinance as yf
+
+DB_DATEI = Path(__file__).with_name("kurse.db")
+HISTORIE_JAHRE = 5
+MIN_UMSATZ = 5_000_000  # durchschnittlicher Tagesumsatz (20 Tage) für Aktien
+
+# Wikipedia-Listen: (Gruppe, URL)
+AKTIEN_QUELLEN = [
+    ("SP500", "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"),
+    ("NDX", "https://en.wikipedia.org/wiki/Nasdaq-100"),
+    ("DAX", "https://en.wikipedia.org/wiki/DAX"),
+]
+
+NOTFALL_AKTIEN = [
+    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "JPM", "XOM", "SAP.DE",
+]
+
+KRYPTO = {
+    "BTC-USD": "Bitcoin", "ETH-USD": "Ethereum", "BNB-USD": "BNB",
+    "XRP-USD": "XRP", "SOL-USD": "Solana", "ADA-USD": "Cardano",
+    "DOGE-USD": "Dogecoin", "TRX-USD": "TRON", "AVAX-USD": "Avalanche",
+    "LINK-USD": "Chainlink", "DOT-USD": "Polkadot", "LTC-USD": "Litecoin",
+    "BCH-USD": "Bitcoin Cash", "XLM-USD": "Stellar", "ATOM-USD": "Cosmos",
+}
+
+ROHSTOFFE = {
+    "GC=F": "Gold", "SI=F": "Silber", "PL=F": "Platin", "HG=F": "Kupfer",
+    "CL=F": "Öl (WTI)", "BZ=F": "Öl (Brent)", "NG=F": "Erdgas",
+    "ZW=F": "Weizen", "ZC=F": "Mais", "ZS=F": "Sojabohnen",
+    "KC=F": "Kaffee", "SB=F": "Zucker", "CT=F": "Baumwolle",
+}
+
+
+# ---------- Datenbank ----------
+def verbinde() -> sqlite3.Connection:
+    con = sqlite3.connect(DB_DATEI)
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS universum ("
+        "ticker TEXT PRIMARY KEY, name TEXT, gruppe TEXT, liquide INTEGER DEFAULT 1)"
+    )
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS kurse ("
+        "ticker TEXT, datum TEXT, open REAL, high REAL, low REAL, close REAL, "
+        "volume REAL, PRIMARY KEY (ticker, datum))"
+    )
+    return con
+
+
+def lade_kurse(ticker: str, con: sqlite3.Connection | None = None) -> pd.DataFrame:
+    """Für spätere Bausteine: Kurse eines Werts als DataFrame (Index = Datum)."""
+    eigene = con is None
+    con = con or verbinde()
+    df = pd.read_sql_query(
+        "SELECT datum, open AS Open, high AS High, low AS Low, close AS Close, "
+        "volume AS Volume FROM kurse WHERE ticker = ? ORDER BY datum",
+        con, params=(ticker,), parse_dates=["datum"], index_col="datum",
+    )
+    if eigene:
+        con.close()
+    return df
+
+
+# ---------- Universum ----------
+def _wiki_liste(url: str, gruppe: str) -> list[tuple[str, str]]:
+    anfrage = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (trading-basis)"})
+    kontext = ssl.create_default_context(cafile=certifi.where())
+    html = urllib.request.urlopen(anfrage, timeout=30, context=kontext).read().decode("utf-8")
+    for tab in pd.read_html(io.StringIO(html)):
+        tab.columns = [c[0] if isinstance(c, tuple) else c for c in tab.columns]
+        spalten = {str(c).strip().lower(): c for c in tab.columns}
+        sym = next((c for k, c in spalten.items() if "ticker" in k or "symbol" in k), None)
+        nam = next(
+            (c for k, c in spalten.items() if "company" in k or "security" in k or k == "name"),
+            None,
+        )
+        if sym is None or len(tab) < 20:
+            continue
+        ergebnis = []
+        for _, zeile in tab.iterrows():
+            t = str(zeile[sym]).strip()
+            if ":" in t:
+                t = t.split(":")[-1].strip()
+            if not t or t.lower() == "nan":
+                continue
+            if gruppe == "DAX":
+                if "." not in t:  # z. B. ADS -> ADS.DE, AIR.PA bleibt AIR.PA
+                    t += ".DE"
+            else:
+                t = t.replace(".", "-")  # z. B. BRK.B -> BRK-B
+            ergebnis.append((t, str(zeile[nam]) if nam is not None else t))
+        return ergebnis
+    raise ValueError("keine passende Tabelle gefunden")
+
+
+def baue_universum(con: sqlite3.Connection) -> None:
+    eintraege: dict[str, tuple[str, str]] = {}
+    for gruppe, url in AKTIEN_QUELLEN:
+        try:
+            liste = _wiki_liste(url, gruppe)
+            print(f"  {gruppe}: {len(liste)} Werte gefunden")
+            for ticker, name in liste:
+                eintraege.setdefault(ticker, (name, gruppe))
+        except Exception as fehler:
+            print(f"  Warnung: {gruppe}-Liste konnte nicht geladen werden "
+                  f"[{type(fehler).__name__}: {fehler}]")
+
+    if not eintraege:
+        print("  Keine Aktienlisten verfügbar, nutze kleine Notfall-Liste.")
+        for ticker in NOTFALL_AKTIEN:
+            eintraege[ticker] = (ticker, "NOTFALL")
+
+    for ticker, name in KRYPTO.items():
+        eintraege[ticker] = (name, "KRYPTO")
+    for ticker, name in ROHSTOFFE.items():
+        eintraege[ticker] = (name, "ROHSTOFF")
+
+    con.execute("DELETE FROM universum")
+    con.executemany(
+        "INSERT INTO universum (ticker, name, gruppe) VALUES (?, ?, ?)",
+        [(t, n, g) for t, (n, g) in eintraege.items()],
+    )
+    con.commit()
+    print(f"Universum: {len(eintraege)} Werte insgesamt.")
+
+
+# ---------- Kurse laden ----------
+def _zerlege(df: pd.DataFrame, tickers: list[str]) -> dict[str, pd.DataFrame]:
+    ergebnis: dict[str, pd.DataFrame] = {}
+    if df is None or df.empty:
+        return ergebnis
+    if isinstance(df.columns, pd.MultiIndex):
+        if "Close" in df.columns.get_level_values(0):  # Felder oben (ein Wert)
+            einzeln = df.copy()
+            einzeln.columns = einzeln.columns.get_level_values(0)
+            ergebnis[tickers[0]] = einzeln.dropna(how="all")
+        else:
+            vorhanden = set(df.columns.get_level_values(0))
+            for t in tickers:
+                if t in vorhanden:
+                    teil = df[t].dropna(how="all")
+                    if not teil.empty:
+                        ergebnis[t] = teil
+    else:
+        ergebnis[tickers[0]] = df.dropna(how="all")
+    return ergebnis
+
+
+def _speichere(con: sqlite3.Connection, ticker: str, df: pd.DataFrame) -> None:
+    df = df.dropna(subset=["Close"])
+    if df.empty:
+        return
+    idx = pd.DatetimeIndex(df.index).tz_localize(None)
+    zeilen = [
+        (ticker, d.strftime("%Y-%m-%d"), float(o), float(h), float(l), float(c), float(v))
+        for d, o, h, l, c, v in zip(
+            idx, df["Open"], df["High"], df["Low"], df["Close"], df["Volume"]
+        )
+    ]
+    con.executemany(
+        "INSERT OR REPLACE INTO kurse (ticker, datum, open, high, low, close, volume) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        zeilen,
+    )
+
+
+def _anpassung_geaendert(con: sqlite3.Connection, ticker: str, df: pd.DataFrame,
+                         letzte_datum: str) -> bool:
+    """Prüft, ob sich bereits gespeicherte Kurse rückwirkend verändert haben
+    (Aktiensplit oder Dividende). Dann muss die Historie neu geladen werden,
+    sonst entstehen künstliche Kurslücken in den Daten."""
+    idx = pd.DatetimeIndex(df.index).tz_localize(None).strftime("%Y-%m-%d")
+    neu = pd.Series(df["Close"].values, index=idx)
+    grenze = (date.fromisoformat(letzte_datum) - timedelta(days=3)).isoformat()
+    ab = idx.min()
+    gespeichert = con.execute(
+        "SELECT datum, close FROM kurse WHERE ticker = ? AND datum >= ? AND datum <= ?",
+        (ticker, ab, grenze),
+    ).fetchall()
+    for datum, close_alt in gespeichert:
+        close_neu = neu.get(datum)
+        if (close_neu is not None and pd.notna(close_neu) and close_alt
+                and abs(close_neu / close_alt - 1) > 0.001):
+            return True
+    return False
+
+
+def _lade_batches(con: sqlite3.Connection, tickers: list[str], start: date,
+                  batch: int = 50, letzte: dict | None = None) -> list[str]:
+    geaendert: list[str] = []
+    for i in range(0, len(tickers), batch):
+        teil = tickers[i:i + batch]
+        print(f"  Lade Werte {i + 1}-{i + len(teil)} von {len(tickers)} ...")
+        try:
+            df = yf.download(
+                teil, start=start.isoformat(), auto_adjust=True,
+                group_by="ticker", threads=True, progress=False,
+            )
+        except Exception as fehler:
+            print(f"  Fehler bei diesem Paket: {fehler}")
+            continue
+        for ticker, daten in _zerlege(df, teil).items():
+            if letzte and ticker in letzte and _anpassung_geaendert(
+                    con, ticker, daten, letzte[ticker]):
+                geaendert.append(ticker)
+            _speichere(con, ticker, daten)
+        con.commit()
+        time.sleep(1)  # freundlich zur Datenquelle
+    return geaendert
+
+
+def aktualisiere(con: sqlite3.Connection) -> None:
+    tickers = [r[0] for r in con.execute("SELECT ticker FROM universum")]
+    letzte = dict(con.execute(
+        "SELECT ticker, MAX(datum) FROM kurse GROUP BY ticker").fetchall())
+    neu = [t for t in tickers if t not in letzte]
+    alt = [t for t in tickers if t in letzte]
+    heute = date.today()
+
+    if neu:
+        print(f"Volle Historie für {len(neu)} Werte ({HISTORIE_JAHRE} Jahre) ...")
+        _lade_batches(con, neu, heute - timedelta(days=365 * HISTORIE_JAHRE))
+    if alt:
+        start = min(date.fromisoformat(letzte[t]) for t in alt) - timedelta(days=10)
+        print(f"Update für {len(alt)} Werte ab {start} ...")
+        geaendert = _lade_batches(con, alt, start, letzte=letzte)
+        if geaendert:
+            print(f"Kursanpassung (Split/Dividende) bei {len(geaendert)} Werten erkannt, "
+                  "lade deren Historie komplett neu ...")
+            _lade_batches(con, geaendert, heute - timedelta(days=365 * HISTORIE_JAHRE))
+
+
+# ---------- Liquidität und Status ----------
+def berechne_liquiditaet(con: sqlite3.Connection) -> None:
+    """Aktien mit zu wenig Tagesumsatz werden als nicht liquide markiert."""
+    for ticker, gruppe in con.execute("SELECT ticker, gruppe FROM universum").fetchall():
+        if gruppe in ("KRYPTO", "ROHSTOFF"):
+            liquide = 1
+        else:
+            zeilen = con.execute(
+                "SELECT close, volume FROM kurse WHERE ticker = ? "
+                "ORDER BY datum DESC LIMIT 20", (ticker,)).fetchall()
+            umsaetze = [c * v for c, v in zeilen if c is not None and v is not None]
+            liquide = int(bool(umsaetze) and sum(umsaetze) / len(umsaetze) >= MIN_UMSATZ)
+        con.execute("UPDATE universum SET liquide = ? WHERE ticker = ?", (liquide, ticker))
+    con.commit()
+
+
+def status(con: sqlite3.Connection) -> None:
+    print("\nGruppe      Werte   liquide")
+    for gruppe, n, l in con.execute(
+            "SELECT gruppe, COUNT(*), SUM(liquide) FROM universum GROUP BY gruppe"):
+        print(f"{gruppe:<10} {n:>6} {l or 0:>9}")
+    n_kurse, anzahl, letzte = con.execute(
+        "SELECT COUNT(*), COUNT(DISTINCT ticker), MAX(datum) FROM kurse").fetchone()
+    print(f"\nKurszeilen: {n_kurse} | Werte mit Daten: {anzahl} | neuester Tag: {letzte}")
+    ohne = [r[0] for r in con.execute(
+        "SELECT ticker FROM universum WHERE ticker NOT IN (SELECT DISTINCT ticker FROM kurse)")]
+    if ohne:
+        print(f"Ohne Kursdaten ({len(ohne)}): {', '.join(ohne[:15])}" + (" ..." if len(ohne) > 15 else ""))
+
+
+def main() -> None:
+    befehl = sys.argv[1] if len(sys.argv) > 1 else "hilfe"
+    con = verbinde()
+    if befehl == "init":
+        print("Baue Universum auf ...")
+        baue_universum(con)
+        aktualisiere(con)
+        berechne_liquiditaet(con)
+        status(con)
+    elif befehl == "update":
+        aktualisiere(con)
+        berechne_liquiditaet(con)
+        status(con)
+    elif befehl == "status":
+        status(con)
+    else:
+        print("Befehle: init | update | status")
+    con.close()
+
+
+if __name__ == "__main__":
+    main()
+
+"""
+Schritt 1: Signal-Journal (Paper-Trading) für den Ansatz
+"Kurslücke nach oben mit hohem Volumen" bei Aktien.
+
+Aufrufe:
+    python journal.py          täglicher Lauf: Kurse laden, neue Signale suchen,
+                               Ergebnisse offener Trades nachtragen, Meldung per ntfy
+    python journal.py schnell  wie oben, aber ohne neue Kurse zu laden
+    python journal.py bilanz   Zwischenbilanz des Journals anzeigen
+    python journal.py test     Test-Benachrichtigung aufs iPhone
+
+Regeln (nicht mitten im Test ändern, sonst ist die Auswertung wertlos):
+- Signal: Eine liquide Aktie (S&P 500 / DAX) hat am letzten abgeschlossenen
+  Handelstag eine Kurslücke von mindestens +3 % und mindestens das Doppelte
+  des 20-Tage-Durchschnittsvolumens (Werte aus scan.py).
+- Einstieg: Eröffnungskurs des nächsten Handelstags. Ausstieg: Schlusskurs
+  nach 3 bzw. 5 Handelstagen ab dem Signaltag (wie im Backtest).
+- Pro Aktie läuft höchstens ein offener Trade.
+- Kosten: 0,1 % pro Trade (wie im Backtest) werden abgezogen.
+- Lücken über 50 % gelten als verdächtig (Datenfehler/Split) und werden ignoriert.
+- Es zählt nur der jeweils letzte abgeschlossene Handelstag. Läuft das Skript
+  an einem Tag nicht, fehlen die Signale dieses Tages im Journal.
+
+Das Journal ist Paper-Trading: Es wird nichts gekauft. Keine Anlageberatung.
+
+ntfy: Der Topic-Name wird aus der Umgebungsvariable NTFY_TOPIC gelesen oder aus
+der Datei ntfy_topic.txt (eine Zeile) im selben Ordner.
+"""
+import os
+import ssl
+import sys
+import urllib.request
+from datetime import date, timedelta
+from pathlib import Path
+
+import certifi
+import pandas as pd
+
+from daten_basis import aktualisiere, berechne_liquiditaet, verbinde
+from scan import GAP_SCHWELLE, GAP_VOLUMEN
+
+KOSTEN = 0.0010            # je Trade, wie im Backtest für Aktien
+MAX_PLAUSIBEL_GAP = 0.50   # größere Lücken gelten als verdächtig
+MAX_ALTER_TAGE = 5         # Signal-Kerze darf höchstens so alt sein
+
+
+# ---------- Datenbank ----------
+def tabelle_anlegen(con) -> None:
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS journal ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "ticker TEXT, name TEXT, gruppe TEXT, "
+        "signal_datum TEXT, signal_close REAL, gap REAL, vol_ratio REAL, "
+        "einstieg_datum TEXT, einstieg_preis REAL, "
+        "ausstieg3_datum TEXT, ausstieg3_preis REAL, ergebnis3 REAL, "
+        "ausstieg5_datum TEXT, ausstieg5_preis REAL, ergebnis5 REAL, "
+        "angelegt TEXT, UNIQUE (ticker, signal_datum))"
+    )
+    con.commit()
+
+
+# ---------- Signale finden ----------
+def finde_signale(con) -> list[dict]:
+    heute = date.today()
+    seit = (heute - timedelta(days=60)).isoformat()
+    df = pd.read_sql_query(
+        "SELECT k.ticker, k.datum, k.open, k.close, k.volume "
+        "FROM kurse k JOIN universum u ON u.ticker = k.ticker "
+        "WHERE u.liquide = 1 AND u.gruppe NOT IN ('KRYPTO', 'ROHSTOFF') "
+        "AND k.datum >= ? AND k.datum < ? ORDER BY k.ticker, k.datum",
+        con, params=(seit, heute.isoformat()), parse_dates=["datum"],
+    )
+    info = {t: (n, g) for t, n, g in con.execute("SELECT ticker, name, gruppe FROM universum")}
+
+    signale = []
+    for ticker, g in df.groupby("ticker"):
+        g = g.dropna(subset=["close"]).reset_index(drop=True)
+        if len(g) < 21:
+            continue
+        letzte, vortag = g.iloc[-1], g.iloc[-2]
+        if (pd.Timestamp(heute) - letzte["datum"]).days > MAX_ALTER_TAGE:
+            continue
+        schnitt = g["volume"].iloc[-21:-1].mean()
+        if pd.isna(schnitt) or schnitt <= 0 or pd.isna(letzte["volume"]):
+            continue
+        gap = letzte["open"] / vortag["close"] - 1
+        vr = letzte["volume"] / schnitt
+        if gap >= GAP_SCHWELLE and vr >= GAP_VOLUMEN:
+            if gap > MAX_PLAUSIBEL_GAP:
+                print(f"  Übersprungen (verdächtige Lücke {gap:+.0%}): {ticker}")
+                continue
+            signale.append({
+                "ticker": ticker, "name": info[ticker][0], "gruppe": info[ticker][1],
+                "datum": letzte["datum"].strftime("%Y-%m-%d"),
+                "close": float(letzte["close"]), "gap": float(gap), "vr": float(vr),
+            })
+    signale.sort(key=lambda s: s["vr"], reverse=True)
+    return signale
+
+
+def trage_signale_ein(con, signale: list[dict]) -> list[dict]:
+    neue = []
+    heute = date.today().isoformat()
+    for s in signale:
+        offen = con.execute(
+            "SELECT 1 FROM journal WHERE ticker = ? AND ausstieg5_datum IS NULL",
+            (s["ticker"],),
+        ).fetchone()
+        if offen:
+            continue
+        cur = con.execute(
+            "INSERT OR IGNORE INTO journal "
+            "(ticker, name, gruppe, signal_datum, signal_close, gap, vol_ratio, angelegt) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (s["ticker"], s["name"], s["gruppe"], s["datum"], s["close"],
+             s["gap"], s["vr"], heute),
+        )
+        if cur.rowcount == 1:
+            neue.append(s)
+    con.commit()
+    return neue
+
+
+# ---------- Ergebnisse nachtragen ----------
+def aktualisiere_ergebnisse(con) -> list[dict]:
+    heute = date.today().isoformat()
+    offen = con.execute(
+        "SELECT id, ticker, signal_datum, ergebnis3 FROM journal "
+        "WHERE ausstieg5_datum IS NULL"
+    ).fetchall()
+    abgeschlossen = []
+    for id_, ticker, sdat, ergebnis3_alt in offen:
+        zeilen = con.execute(
+            "SELECT datum, open, close FROM kurse WHERE ticker = ? AND datum > ? "
+            "AND datum < ? ORDER BY datum LIMIT 5",
+            (ticker, sdat, heute),
+        ).fetchall()
+        if not zeilen:
+            continue
+        einstieg_preis = zeilen[0][1]
+        if not einstieg_preis or einstieg_preis <= 0:
+            continue
+        felder = {"einstieg_datum": zeilen[0][0], "einstieg_preis": einstieg_preis}
+        if len(zeilen) >= 3:
+            erg = zeilen[2][2] / einstieg_preis - 1 - KOSTEN
+            felder.update(ausstieg3_datum=zeilen[2][0], ausstieg3_preis=zeilen[2][2],
+                          ergebnis3=erg)
+            if ergebnis3_alt is None:
+                abgeschlossen.append({"ticker": ticker, "h": 3, "ergebnis": erg})
+        if len(zeilen) >= 5:
+            erg = zeilen[4][2] / einstieg_preis - 1 - KOSTEN
+            felder.update(ausstieg5_datum=zeilen[4][0], ausstieg5_preis=zeilen[4][2],
+                          ergebnis5=erg)
+            abgeschlossen.append({"ticker": ticker, "h": 5, "ergebnis": erg})
+        sets = ", ".join(f"{k} = ?" for k in felder)
+        con.execute(f"UPDATE journal SET {sets} WHERE id = ?", (*felder.values(), id_))
+    con.commit()
+    return abgeschlossen
+
+
+# ---------- Bilanz ----------
+def bilanz_text(con) -> str:
+    df = pd.read_sql_query("SELECT * FROM journal ORDER BY signal_datum, ticker", con)
+    if df.empty:
+        return "Das Journal ist noch leer."
+    zeilen = [f"Trades gesamt: {len(df)} | noch offen: {int(df['ausstieg5_datum'].isna().sum())}"]
+    for h, spalte in ((3, "ergebnis3"), (5, "ergebnis5")):
+        r = df[spalte].dropna()
+        if r.empty:
+            zeilen.append(f"Haltedauer {h} Tage: noch keine abgeschlossenen Trades")
+        else:
+            zeilen.append(
+                f"Haltedauer {h} Tage (nach Kosten): {len(r)} abgeschlossen | "
+                f"Ø {r.mean():+.2%} | Median {r.median():+.2%} | "
+                f"Treffer {(r > 0).mean():.0%} | schlechtester {r.min():+.2%} | "
+                f"bester {r.max():+.2%}"
+            )
+    zeilen.append("Erst ab etwa 30 abgeschlossenen Trades ist das aussagekräftig.")
+    return "\n".join(zeilen)
+
+
+def zeige_bilanz(con) -> None:
+    print(bilanz_text(con))
+    df = pd.read_sql_query("SELECT * FROM journal ORDER BY signal_datum, ticker", con)
+    if df.empty:
+        return
+    print("\nLetzte Einträge:")
+    print("Signal      Aktie       Lücke  Volumen   3 Tage    5 Tage")
+    for _, z in df.tail(15).iterrows():
+        e3 = f"{z['ergebnis3']:+.2%}" if pd.notna(z["ergebnis3"]) else "offen"
+        e5 = f"{z['ergebnis5']:+.2%}" if pd.notna(z["ergebnis5"]) else "offen"
+        print(f"{z['signal_datum']}  {z['ticker']:<10} {z['gap']:>+6.1%}  x{z['vol_ratio']:<5.1f} "
+              f"{e3:>8}  {e5:>8}")
+
+
+# ---------- Benachrichtigung ----------
+def lese_topic() -> str | None:
+    topic = os.environ.get("NTFY_TOPIC")
+    if topic and topic.strip():
+        return topic.strip()
+    datei = Path(__file__).with_name("ntfy_topic.txt")
+    if datei.exists():
+        inhalt = datei.read_text().strip()
+        return inhalt or None
+    return None
+
+
+def sende_push(titel: str, text: str) -> None:
+    topic = lese_topic()
+    if not topic:
+        print("Hinweis: Kein ntfy-Topic gefunden, es wird keine Meldung gesendet.")
+        return
+    anfrage = urllib.request.Request(
+        f"https://ntfy.sh/{topic}",
+        data=text.encode("utf-8"),
+        headers={
+            "Title": titel.encode("latin-1", "replace").decode("latin-1"),
+            "Tags": "chart_with_upwards_trend",
+            "User-Agent": "trading-journal/1.0",
+        },
+        method="POST",
+    )
+    try:
+        kontext = ssl.create_default_context(cafile=certifi.where())
+        urllib.request.urlopen(anfrage, timeout=20, context=kontext).read()
+        print("Meldung aufs iPhone gesendet.")
+    except Exception as fehler:
+        print(f"Versand fehlgeschlagen [{type(fehler).__name__}: {fehler}]")
+
+
+def baue_nachricht(con, neue: list[dict], abgeschlossen: list[dict]) -> tuple[str, str] | None:
+    teile = []
+    if neue:
+        teile.append("Neue Signale (Kurslücke nach oben, hohes Volumen, Aktien):")
+        for s in neue[:15]:
+            teile.append(f"- {s['ticker']} ({s['name'][:24]}): Lücke {s['gap']:+.1%}, "
+                         f"Volumen x{s['vr']:.1f}, Schluss {s['close']:.2f}")
+        if len(neue) > 15:
+            teile.append(f"... und {len(neue) - 15} weitere")
+        teile.append("Regel: Einstieg zur nächsten Eröffnung, Ausstieg nach 3 bzw. 5 Handelstagen.")
+    if abgeschlossen:
+        teile.append("")
+        teile.append("Abgeschlossen (nach Kosten):")
+        for a in abgeschlossen[:15]:
+            teile.append(f"- {a['ticker']}: {a['h']} Tage {a['ergebnis']:+.2%}")
+    montag = date.today().weekday() == 0
+    hat_ergebnisse = con.execute(
+        "SELECT COUNT(*) FROM journal WHERE ergebnis3 IS NOT NULL").fetchone()[0] > 0
+    if montag and hat_ergebnisse:
+        teile += ["", "Wochenbilanz:", bilanz_text(con)]
+    if not teile:
+        return None
+    teile += ["", "Paper-Trading, keine Anlageberatung."]
+    titel = f"Journal: {len(neue)} neu, {len(abgeschlossen)} abgeschlossen"
+    return titel, "\n".join(teile)
+
+
+# ---------- Hauptprogramm ----------
+def main() -> None:
+    befehl = sys.argv[1] if len(sys.argv) > 1 else "lauf"
+    con = verbinde()
+    tabelle_anlegen(con)
+
+    if befehl == "test":
+        sende_push("Test", "Wenn du das liest, funktionieren die Benachrichtigungen.")
+    elif befehl == "bilanz":
+        zeige_bilanz(con)
+    elif befehl in ("lauf", "schnell"):
+        if befehl == "lauf":
+            print("Lade neue Kurse ...")
+            aktualisiere(con)
+            berechne_liquiditaet(con)
+        signale = finde_signale(con)
+        neue = trage_signale_ein(con, signale)
+        abgeschlossen = aktualisiere_ergebnisse(con)
+
+        print(f"\nSignale auf der letzten Handelskerze: {len(signale)} | "
+              f"neu ins Journal: {len(neue)} | neu abgeschlossen: {len(abgeschlossen)}")
+        for s in neue:
+            print(f"  NEU {s['ticker']:<10} {s['name'][:26]:<26} Lücke {s['gap']:+.1%} "
+                  f"| Volumen x{s['vr']:.1f} | Schluss {s['close']:.2f} (Kerze {s['datum']})")
+        for a in abgeschlossen:
+            print(f"  FERTIG {a['ticker']:<10} {a['h']} Tage: {a['ergebnis']:+.2%}")
+        print()
+        print(bilanz_text(con))
+
+        nachricht = baue_nachricht(con, neue, abgeschlossen)
+        if nachricht:
+            sende_push(*nachricht)
+        else:
+            print("\nNichts Neues, keine Meldung gesendet.")
+    else:
+        print("Befehle: (ohne) | schnell | bilanz | test")
+    con.close()
+
+
+if __name__ == "__main__":
+    main()
+
+"""
+Täglicher Lauf auf GitHub (siehe .github/workflows/update.yml).
+
+Ablauf:
+1. Universum und 5 Jahre Kurse frisch laden (kostenlos über yfinance).
+2. Journal aus data/journal.csv wiederherstellen, neue Signale eintragen,
+   Ergebnisse abgelaufener Trades nachtragen, Journal wieder speichern.
+3. Marktscan über alle Werte (Aktien, Krypto, Rohstoffe).
+4. Backtest (einmal pro Woche neu, sonst aus data/backtest.csv).
+5. Webseite docs/index.html bauen.
+6. Meldung aufs iPhone per ntfy (Topic aus dem GitHub-Secret NTFY_TOPIC).
+
+Bricht ab (und veröffentlicht NICHTS), wenn die Daten unvollständig sind. Dann
+bleibt die letzte funktionierende Seite stehen und GitHub meldet den Fehler.
+
+Keine Anlageberatung.
+"""
+import os
+import sys
+import time
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import pandas as pd
+
+import backtest as bt
+import journal
+import scan as scanmodul
+import seite
+from daten_basis import (DB_DATEI, HISTORIE_JAHRE, _lade_batches, aktualisiere, baue_universum,
+                         berechne_liquiditaet, verbinde)
+
+BASIS = Path(__file__).resolve().parent
+DATEN = BASIS / "data"
+DOCS = BASIS / "docs"
+JOURNAL_CSV = DATEN / "journal.csv"
+BACKTEST_CSV = DATEN / "backtest.csv"
+BACKTEST_STAND = DATEN / "backtest_stand.txt"
+
+BACKTEST_ALTER_TAGE = 7
+MIN_UNIVERSUM = 300       # darunter wurden die Aktienlisten nicht geladen
+MIN_ABDECKUNG = 0.80      # Anteil der Werte, die Kursdaten haben müssen
+MAX_KERZE_ALTER = 6       # letzte Aktien-Kerze darf höchstens so alt sein (Tage)
+
+
+def fehler_abbruch(text: str) -> None:
+    print(f"\nABBRUCH: {text}\nDie Webseite wird nicht aktualisiert.")
+    sys.exit(1)
+
+
+def lade_daten(con) -> None:
+    print("Baue Universum auf ...")
+    baue_universum(con)
+    uni = con.execute("SELECT COUNT(*) FROM universum").fetchone()[0]
+    if uni < MIN_UNIVERSUM:
+        fehler_abbruch(f"Nur {uni} Werte im Universum (Aktienlisten nicht ladbar).")
+
+    aktualisiere(con)  # volle Historie, die Datenbank ist in der Cloud jedes Mal leer
+
+    heute = date.today()
+    for runde in range(1, 4):
+        fehlend = [r[0] for r in con.execute(
+            "SELECT ticker FROM universum WHERE ticker NOT IN (SELECT DISTINCT ticker FROM kurse)")]
+        if len(fehlend) <= (1 - MIN_ABDECKUNG) / 4 * uni:
+            break
+        print(f"Runde {runde}: {len(fehlend)} Werte ohne Daten, warte kurz und versuche es erneut ...")
+        time.sleep(60)
+        _lade_batches(con, fehlend, heute - timedelta(days=365 * HISTORIE_JAHRE), batch=20)
+
+    mit_daten = con.execute("SELECT COUNT(DISTINCT ticker) FROM kurse").fetchone()[0]
+    if mit_daten < MIN_ABDECKUNG * uni:
+        fehler_abbruch(f"Nur {mit_daten} von {uni} Werten haben Kursdaten (Datenquelle blockiert?).")
+
+    letzte = con.execute(
+        "SELECT MAX(k.datum) FROM kurse k JOIN universum u ON u.ticker = k.ticker "
+        "WHERE u.gruppe NOT IN ('KRYPTO', 'ROHSTOFF') AND k.datum < ?",
+        (heute.isoformat(),)).fetchone()[0]
+    if not letzte or (heute - date.fromisoformat(letzte)).days > MAX_KERZE_ALTER:
+        fehler_abbruch(f"Die neueste Aktien-Kerze ({letzte}) ist zu alt.")
+
+    berechne_liquiditaet(con)
+
+
+def journal_fuehren(con):
+    journal.tabelle_anlegen(con)
+    if JOURNAL_CSV.exists():
+        alt = pd.read_csv(JOURNAL_CSV)
+        if not alt.empty:
+            alt.to_sql("journal", con, if_exists="append", index=False)
+    signale = journal.finde_signale(con)
+    neue = journal.trage_signale_ein(con, signale)
+    abgeschlossen = journal.aktualisiere_ergebnisse(con)
+    pd.read_sql_query("SELECT * FROM journal ORDER BY id", con).to_csv(JOURNAL_CSV, index=False)
+    return signale, neue, abgeschlossen
+
+
+def backtest_holen(con):
+    heute = date.today()
+    if BACKTEST_CSV.exists() and BACKTEST_STAND.exists():
+        try:
+            stand = date.fromisoformat(BACKTEST_STAND.read_text().strip())
+            if (heute - stand).days < BACKTEST_ALTER_TAGE:
+                return pd.read_csv(BACKTEST_CSV), stand
+        except Exception as fehler:
+            print(f"Gespeicherter Backtest nicht lesbar ({fehler}), rechne neu.")
+    print("Rechne Backtest neu (dauert etwa 1 bis 2 Minuten) ...")
+    kurse, klasse_von = bt.lade_kurse(con)
+    alle = bt.baue_tabelle(kurse, klasse_von)
+    erg = bt.analysiere(alle)
+    if erg.empty:
+        return erg, heute
+    erg["streng"] = erg.apply(bt.streng_bestanden, axis=1)
+    erg.to_csv(BACKTEST_CSV, index=False)
+    BACKTEST_STAND.write_text(heute.isoformat())
+    return erg, heute
+
+
+def seiten_url() -> str | None:
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    if not repo or "/" not in repo:
+        return None
+    besitzer, name = repo.split("/", 1)
+    return f"https://{besitzer.lower()}.github.io/{name}/"
+
+
+def main() -> None:
+    start = time.time()
+    DATEN.mkdir(exist_ok=True)
+    DOCS.mkdir(exist_ok=True)
+    if DB_DATEI.exists():
+        DB_DATEI.unlink()
+    con = verbinde()
+
+    lade_daten(con)
+    signale, neue, abgeschlossen = journal_fuehren(con)
+    print(f"Signale: {len(signale)} | neu im Journal: {len(neue)} | abgeschlossen: {len(abgeschlossen)}")
+
+    try:
+        scan_tab = scanmodul.scan(con)
+    except Exception as fehler:
+        print(f"Scan fehlgeschlagen: {type(fehler).__name__}: {fehler}")
+        scan_tab = None
+
+    erg, bt_stand = backtest_holen(con)
+
+    heute = date.today().isoformat()
+    journal_df = pd.read_sql_query("SELECT * FROM journal ORDER BY signal_datum DESC, ticker", con)
+    letzte_kurse = {}
+    for ticker in journal_df.loc[journal_df["ausstieg5_datum"].isna(), "ticker"]:
+        zeile = con.execute("SELECT close FROM kurse WHERE ticker = ? AND datum < ? "
+                            "ORDER BY datum DESC LIMIT 1", (ticker, heute)).fetchone()
+        if zeile:
+            letzte_kurse[ticker] = zeile[0]
+
+    uni = con.execute("SELECT COUNT(*) FROM universum").fetchone()[0]
+    mit_daten = con.execute("SELECT COUNT(DISTINCT ticker) FROM kurse").fetchone()[0]
+    ohne_ndx = con.execute("SELECT COUNT(*) FROM universum WHERE gruppe = 'NDX'").fetchone()[0] == 0
+    letzte_kerze = con.execute(
+        "SELECT MAX(k.datum) FROM kurse k JOIN universum u ON u.ticker = k.ticker "
+        "WHERE u.gruppe NOT IN ('KRYPTO', 'ROHSTOFF') AND k.datum < ?", (heute,)).fetchone()[0]
+    stand = datetime.now(ZoneInfo("Europe/Berlin"))
+    status = {
+        "Werte im Universum": f"{uni} (S&P 500, DAX, 15 Krypto, 13 Rohstoffe)",
+        "Werte mit Kursdaten": str(mit_daten),
+        "Letzte Aktien-Tageskerze": seite.datum(letzte_kerze),
+        "Datenquelle": "yfinance (kostenlos, inoffiziell, kann Lücken haben)",
+        "Nasdaq 100": "nicht im Universum (Liste nicht ladbar)" if ohne_ndx else "enthalten",
+        "Bekannte Verzerrung": "Nur heutige Index-Mitglieder und Top-Coins (Überlebensverzerrung)",
+        "Laufzeit": f"{time.time() - start:.0f} Sekunden",
+    }
+
+    html_text = seite.baue_seite(stand, signale, {s["ticker"] for s in neue}, journal_df,
+                                 letzte_kurse, scan_tab, erg, bt_stand, status)
+    (DOCS / "index.html").write_text(html_text, encoding="utf-8")
+    print("Webseite geschrieben: docs/index.html")
+
+    nachricht = journal.baue_nachricht(con, neue, abgeschlossen)
+    if nachricht:
+        titel, text = nachricht
+        url = seiten_url()
+        if url:
+            text += f"\n\nDetails: {url}"
+        journal.sende_push(titel, text)
+    else:
+        print("Keine neue Meldung nötig.")
+    con.close()
+
+
+if __name__ == "__main__":
+    main()
+
+yfinance
+pandas
+numpy
+lxml
+certifi
+
+"""
+Baustein 2: Scan mit Kurzfrist-Kennzahlen und Kandidatenliste.
+
+Liest die Kurse aus kurse.db (siehe daten_basis.py), berechnet für alle
+liquiden Werte Kennzahlen auf Tagesbasis und markiert Auffälligkeiten.
+
+Aufrufe:
+    python scan.py            Scan mit den vorhandenen Daten
+    python scan.py update     erst neue Kurse laden, dann scannen
+
+Ergebnis: Ausgabe im Terminal, kandidaten.csv (öffnet sich in Numbers/Excel)
+und ein Eintrag pro Auffälligkeit in der Tabelle scan_log der Datenbank.
+Das Protokoll ist der Anfang des Signal-Journals: Später lässt sich damit
+prüfen, was aus den Auffälligkeiten tatsächlich geworden ist.
+
+WICHTIG: Das sind Auffälligkeiten, keine Kauf- oder Verkaufsempfehlungen. Die
+Schwellenwerte unten sind Annahmen. Ob sie in der Vergangenheit einen
+Vorsprung hatten, prüft erst der Backtest in Baustein 3.
+
+Lernprojekt, keine Anlageberatung.
+"""
+import sys
+from datetime import date, timedelta
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+from daten_basis import aktualisiere, berechne_liquiditaet, verbinde
+
+# ---------- Einstellungen ----------
+HEUTE_EINBEZIEHEN = False   # False: nur abgeschlossene Tageskerzen (bis gestern)
+RUECKBLICK_TAGE = 450       # Kalendertage, genug für die 200-Tage-Linie
+TOP_N = 30                  # so viele Kandidaten werden im Terminal gezeigt
+
+VOLUMEN_SPITZE = 1.5        # Volumen mindestens das 1,5-Fache des 20-Tage-Schnitts
+RSI_UEBERVERKAUFT = 30
+GAP_SCHWELLE = 0.03         # Kurslücke ab 3 %
+GAP_VOLUMEN = 2.0
+
+CSV_DATEI = Path(__file__).with_name("kandidaten.csv")
+
+
+# ---------- Kennzahlen ----------
+def berechne_features(df: pd.DataFrame) -> dict | None:
+    if len(df) < 60:
+        return None
+    o, h, l, c, v = df["open"], df["high"], df["low"], df["close"], df["volume"]
+    vortag = c.shift(1)
+
+    tr = pd.concat([h - l, (h - vortag).abs(), (l - vortag).abs()], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1 / 14, adjust=False).mean()
+
+    delta = c.diff()
+    gewinn = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+    verlust = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+    rsi = 100 - 100 / (1 + gewinn / verlust)
+
+    hoch20 = h.iloc[-21:-1].max()   # die 20 Tage vor dem letzten Tag
+    tief20 = l.iloc[-21:-1].min()
+    vol_schnitt = v.iloc[-21:-1].mean()
+    sma50 = c.rolling(50).mean().iloc[-1]
+    sma200 = c.rolling(200).mean().iloc[-1]
+
+    return {
+        "datenstand": df.index[-1],
+        "close": c.iloc[-1],
+        "ret_1d": c.iloc[-1] / c.iloc[-2] - 1,
+        "ret_3d": c.iloc[-1] / c.iloc[-4] - 1,
+        "ret_5d": c.iloc[-1] / c.iloc[-6] - 1,
+        "ret_20d": c.iloc[-1] / c.iloc[-21] - 1,
+        "gap": o.iloc[-1] / c.iloc[-2] - 1,
+        "vol_ratio": v.iloc[-1] / vol_schnitt if vol_schnitt and vol_schnitt > 0 else np.nan,
+        "atr_pct": atr.iloc[-1] / c.iloc[-1],
+        "tr_ratio": tr.iloc[-1] / atr.iloc[-2],
+        "rsi": rsi.iloc[-1],
+        "ueber_sma50": bool(c.iloc[-1] > sma50),
+        "ueber_sma200": bool(c.iloc[-1] > sma200),
+        "ausbruch_hoch": bool(c.iloc[-1] > hoch20),
+        "ausbruch_tief": bool(c.iloc[-1] < tief20),
+    }
+
+
+def finde_setups(f) -> list[str]:
+    vr = f["vol_ratio"]
+    s = []
+    if f["ausbruch_hoch"] and vr >= VOLUMEN_SPITZE and f["ueber_sma50"]:
+        s.append("Ausbruch nach oben")
+    if f["rsi"] < RSI_UEBERVERKAUFT and f["ueber_sma200"]:
+        s.append("Überverkauft im Aufwärtstrend")
+    if f["ausbruch_tief"] and vr >= VOLUMEN_SPITZE and not f["ueber_sma50"]:
+        s.append("Ausbruch nach unten")
+    if abs(f["gap"]) >= GAP_SCHWELLE and vr >= GAP_VOLUMEN:
+        s.append("Kurslücke mit hohem Volumen")
+    return s
+
+
+# ---------- Daten und Scan ----------
+def lade_alle(con) -> pd.DataFrame:
+    seit = (date.today() - timedelta(days=RUECKBLICK_TAGE)).isoformat()
+    df = pd.read_sql_query(
+        "SELECT k.ticker, k.datum, k.open, k.high, k.low, k.close, k.volume "
+        "FROM kurse k JOIN universum u ON u.ticker = k.ticker "
+        "WHERE u.liquide = 1 AND k.datum >= ? ORDER BY k.ticker, k.datum",
+        con, params=(seit,), parse_dates=["datum"],
+    )
+    if not HEUTE_EINBEZIEHEN:
+        df = df[df["datum"] < pd.Timestamp(date.today())]
+    return df
+
+
+def scan(con) -> pd.DataFrame:
+    kurse = lade_alle(con)
+    info = {t: (n, g) for t, n, g in con.execute("SELECT ticker, name, gruppe FROM universum")}
+    veraltet = pd.Timestamp(date.today() - timedelta(days=7))
+
+    zeilen = []
+    for ticker, df in kurse.groupby("ticker"):
+        df = df.set_index("datum").dropna(subset=["close"])
+        f = berechne_features(df)
+        if f is None or f["datenstand"] < veraltet:
+            continue
+        f.update(ticker=ticker, name=info[ticker][0], gruppe=info[ticker][1])
+        zeilen.append(f)
+
+    tab = pd.DataFrame(zeilen)
+    # Relative Stärke: Rang der 20-Tage-Rendite innerhalb der eigenen Gruppe (0-100)
+    tab["rs_rang"] = tab.groupby("gruppe")["ret_20d"].rank(pct=True) * 100
+    tab["setups"] = [finde_setups(z) for _, z in tab.iterrows()]
+    return tab
+
+
+# ---------- Ausgabe und Protokoll ----------
+def protokolliere(con, kand: pd.DataFrame) -> None:
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS scan_log ("
+        "scan_datum TEXT, datenstand TEXT, ticker TEXT, gruppe TEXT, setup TEXT, "
+        "close REAL, rsi REAL, vol_ratio REAL, ret_5d REAL, "
+        "PRIMARY KEY (datenstand, ticker, setup))"
+    )
+    heute = date.today().isoformat()
+    for _, z in kand.iterrows():
+        for s in z["setups"]:
+            con.execute(
+                "INSERT OR IGNORE INTO scan_log VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (heute, z["datenstand"].strftime("%Y-%m-%d"), z["ticker"], z["gruppe"],
+                 s, float(z["close"]), float(z["rsi"]), float(z["vol_ratio"]),
+                 float(z["ret_5d"])),
+            )
+    con.commit()
+
+
+def zeige(tab: pd.DataFrame) -> pd.DataFrame:
+    kand = tab[tab["setups"].map(len) > 0].copy()
+    kand["anzahl"] = kand["setups"].map(len)
+    kand = kand.sort_values(["anzahl", "vol_ratio"], ascending=False)
+
+    print(f"\nDatenstand: bis {tab['datenstand'].max().date()} | "
+          f"geprüft: {len(tab)} Werte | mit Auffälligkeit: {len(kand)}")
+    haeufigkeit = pd.Series([s for liste in kand["setups"] for s in liste]).value_counts()
+    for name, n in haeufigkeit.items():
+        print(f"  {name}: {n}")
+
+    print(f"\nTop {min(TOP_N, len(kand))} (nach Anzahl der Auffälligkeiten, dann Volumen):\n")
+    for _, z in kand.head(TOP_N).iterrows():
+        print(f"{z['ticker']:<10} {str(z['name'])[:24]:<24} {z['gruppe']:<8} "
+              f"{' + '.join(z['setups'])}")
+        print(f"           Kurs {z['close']:.2f} | 1T {z['ret_1d']:+.1%} | 5T {z['ret_5d']:+.1%} "
+              f"| RSI {z['rsi']:.0f} | Volumen x{z['vol_ratio']:.1f} | RS-Rang {z['rs_rang']:.0f}")
+    return kand
+
+
+def main() -> None:
+    con = verbinde()
+    if len(sys.argv) > 1 and sys.argv[1] == "update":
+        print("Lade neue Kurse ...")
+        aktualisiere(con)
+        berechne_liquiditaet(con)
+
+    tab = scan(con)
+    kand = zeige(tab)
+    protokolliere(con, kand)
+
+    export = kand.copy()
+    export["setups"] = export["setups"].map(" + ".join)
+    spalten = ["ticker", "name", "gruppe", "datenstand", "setups", "close", "ret_1d",
+               "ret_3d", "ret_5d", "ret_20d", "gap", "vol_ratio", "atr_pct", "rsi",
+               "rs_rang", "ueber_sma50", "ueber_sma200"]
+    export[spalten].to_csv(CSV_DATEI, index=False, sep=";", decimal=",", encoding="utf-8-sig")
+    print(f"\nGespeichert: {CSV_DATEI.name} und Protokoll in scan_log. "
+          "Keine Anlageberatung.")
+    con.close()
+
+
+if __name__ == "__main__":
+    main()
+
+"""
+Baut die Webseite docs/index.html aus den Auswertungen (Journal, Scan, Backtest).
+
+Wird von lauf_cloud.py aufgerufen. Die Seite ist eine einzelne HTML-Datei ohne
+externe Abhängigkeiten und für das iPhone optimiert.
+
+Keine Anlageberatung.
+"""
+import html
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+
+GAP_VARIANTE = "Kurslücke nach oben, hohes Volumen -> long"
+
+CSS = """
+:root{--bg:#f5f6f8;--card:#ffffff;--text:#1a1d21;--muted:#667085;--line:#e4e7ec;
+--good:#067647;--goodbg:#e3f5ea;--bad:#b42318;--badbg:#fdeceb;--warn:#8a5a00;--warnbg:#fff4d6}
+@media (prefers-color-scheme: dark){:root{--bg:#0e1116;--card:#161b22;--text:#e6e9ee;--muted:#9aa4b2;
+--line:#2a313b;--good:#56d28a;--goodbg:#12301f;--bad:#ff9b92;--badbg:#3a1714;--warn:#f0c15a;--warnbg:#3a2d0c}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);
+font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+.wrap{max-width:980px;margin:0 auto;padding:16px}
+h1{font-size:1.5rem;margin:8px 0 2px}
+h2{font-size:1.15rem;margin:28px 0 10px}
+.muted{color:var(--muted)}
+.small{font-size:.875rem}
+.banner{background:var(--warnbg);color:var(--warn);border-radius:10px;padding:12px 14px;margin:12px 0}
+.karte{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;margin:10px 0}
+.karte p{margin:6px 0}
+.kopf{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.badge{display:inline-block;border-radius:999px;padding:2px 10px;font-size:.8rem;font-weight:600}
+.badge.ok{background:var(--goodbg);color:var(--good)}
+.badge.no{background:var(--badbg);color:var(--bad)}
+.badge.neutral{background:var(--line);color:var(--muted)}
+.kacheln{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+.kachel{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px}
+.kachel .zahl{font-size:1.35rem;font-weight:700}
+.scroll{overflow-x:auto;background:var(--card);border:1px solid var(--line);border-radius:12px}
+table{border-collapse:collapse;width:100%;font-size:.9rem}
+th,td{padding:8px 10px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}
+th{color:var(--muted);font-weight:600}
+tr:last-child td{border-bottom:0}
+details{margin:10px 0}
+summary{cursor:pointer;font-weight:600}
+.pos{color:var(--good)}
+.neg{color:var(--bad)}
+"""
+
+
+# ---------- kleine Helfer ----------
+def e(x) -> str:
+    return html.escape(str(x))
+
+
+def ist_zahl(x) -> bool:
+    return x is not None and not pd.isna(x)
+
+
+def pct(x, d: int = 2) -> str:
+    return f"{x:+.{d}%}" if ist_zahl(x) else "–"
+
+
+def pct_farbig(x, d: int = 2) -> str:
+    if not ist_zahl(x):
+        return "–"
+    klasse = "pos" if x > 0 else "neg" if x < 0 else ""
+    return f'<span class="{klasse}">{x:+.{d}%}</span>'
+
+
+def datum(iso) -> str:
+    try:
+        return pd.Timestamp(iso).strftime("%d.%m.%Y")
+    except Exception:
+        return "–"
+
+
+def tag_plus(iso: str, n: int) -> str:
+    """Datum n Handelstage nach iso (Wochenenden übersprungen, Feiertage nicht)."""
+    return str(np.busday_offset(iso, n, roll="forward"))
+
+
+def klasse_von_gruppe(gruppe: str) -> str:
+    return {"KRYPTO": "Krypto", "ROHSTOFF": "Rohstoffe"}.get(gruppe, "Aktien")
+
+
+def badge(text: str, art: str = "neutral") -> str:
+    return f'<span class="badge {art}">{e(text)}</span>'
+
+
+def kachel(titel: str, wert: str, sub: str = "") -> str:
+    zusatz = f'<div class="muted small">{e(sub)}</div>' if sub else ""
+    return (f'<div class="kachel"><div class="muted small">{e(titel)}</div>'
+            f'<div class="zahl">{wert}</div>{zusatz}</div>')
+
+
+def tabelle(kopf: list[str], zeilen: list[list[str]], leer: str = "Keine Einträge.") -> str:
+    if not zeilen:
+        return f'<p class="muted">{e(leer)}</p>'
+    th = "".join(f"<th>{e(k)}</th>" for k in kopf)
+    tr = "".join("<tr>" + "".join(f"<td>{z}</td>" for z in zeile) + "</tr>" for zeile in zeilen)
+    return f'<div class="scroll"><table><thead><tr>{th}</tr></thead><tbody>{tr}</tbody></table></div>'
+
+
+# ---------- Backtest-Belege ----------
+def gap_belege(erg) -> dict:
+    """Backtest-Zeilen der getesteten Regel (Aktien, Kurslücke nach oben), je Haltedauer."""
+    if erg is None or erg.empty:
+        return {}
+    teil = erg[(erg["klasse"] == "Aktien") & (erg["variante"] == GAP_VARIANTE)]
+    return {int(z["h"]): z for _, z in teil.iterrows()}
+
+
+def bestaetigte_varianten(erg, klasse: str, setup: str, gap) -> list[str]:
+    """Welche Varianten dieser Auffälligkeit haben den strengen Backtest bestanden?"""
+    if erg is None or erg.empty or "streng" not in erg.columns:
+        return []
+    if setup == "Kurslücke mit hohem Volumen":
+        prefix = "Kurslücke nach oben" if (ist_zahl(gap) and gap > 0) else "Kurslücke nach unten"
+    else:
+        prefix = setup
+    teil = erg[(erg["klasse"] == klasse) & erg["variante"].str.startswith(prefix)
+               & erg["streng"].astype(bool)]
+    return sorted(set(teil["variante"]))
+
+
+# ---------- Abschnitte ----------
+def heute_abschnitt(signale: list[dict], neue_tickers: set, erg) -> str:
+    belege = gap_belege(erg)
+    bestaetigt = any(bool(belege[h].get("streng", False)) for h in (3, 5) if h in belege)
+    teile = ["<h2>Heute: Kaufsignale</h2>"]
+    if not signale:
+        teile.append('<div class="karte"><p>Am letzten Handelstag gab es kein Kaufsignal nach der '
+                     'getesteten Regel. Das ist an den meisten Tagen so.</p></div>')
+        return "".join(teile)
+
+    evid = []
+    for h in (3, 5):
+        if h in belege:
+            b = belege[h]
+            evid.append(f"{h} Tage: Vorsprung {pct(b['vorsprung'])}, Treffer {b['treffer']:.0%}")
+    evid_text = "Backtest (5 Jahre, nach Kosten): " + " · ".join(evid) if evid else ""
+
+    for s in signale:
+        d = s["datum"]
+        einstieg, ex3, ex5 = tag_plus(d, 1), tag_plus(d, 3), tag_plus(d, 5)
+        marken = [badge("Kaufsignal (Paper)", "ok")]
+        if s["ticker"] not in neue_tickers:
+            marken.append(badge("Position schon offen, nicht neu gezählt", "neutral"))
+        if not bestaetigt:
+            marken.append(badge("im aktuellen Backtest nicht mehr bestätigt", "no"))
+        teile.append(
+            '<div class="karte">'
+            f'<div class="kopf"><b>{e(s["ticker"])}</b> <span>{e(s["name"])}</span>{"".join(marken)}</div>'
+            f'<p>Kurslücke {pct(s["gap"], 1)}, Volumen ×{s["vr"]:.1f} des Durchschnitts, '
+            f'Schlusskurs {s["close"]:.2f} (Handelstag {datum(d)}).</p>'
+            f'<p><b>Einstieg:</b> zur Eröffnung am {datum(einstieg)}<br>'
+            f'<b>Halten:</b> 3 bis 5 Handelstage<br>'
+            f'<b>Verkaufen:</b> ca. {datum(ex3)} (nach 3 Tagen) oder ca. {datum(ex5)} (nach 5 Tagen)</p>'
+            f'<p class="muted small">{e(evid_text)}</p>'
+            '</div>'
+        )
+    teile.append('<p class="muted small">Daten stammen von Tageskerzen. Termine ohne Berücksichtigung '
+                 'von Feiertagen. Bei Aktien in US-Dollar und Euro fallen Gebühren und Spreads an, '
+                 'der Backtest rechnet mit 0,1 % je Trade.</p>')
+    return "".join(teile)
+
+
+def offene_abschnitt(journal_df: pd.DataFrame, letzte_kurse: dict) -> str:
+    teile = ["<h2>Offene Positionen (Paper-Trading)</h2>"]
+    if journal_df.empty:
+        teile.append('<p class="muted">Noch keine Einträge.</p>')
+        return "".join(teile)
+    offen = journal_df[journal_df["ausstieg5_datum"].isna()]
+    zeilen = []
+    for _, z in offen.iterrows():
+        sd = z["signal_datum"]
+        if ist_zahl(z["einstieg_preis"]):
+            einstieg = f"{datum(z['einstieg_datum'])} @ {z['einstieg_preis']:.2f}"
+            kurs = letzte_kurse.get(z["ticker"])
+            aktuell = pct_farbig(kurs / z["einstieg_preis"] - 1) if kurs else "–"
+        else:
+            einstieg = f"folgt (ca. {datum(tag_plus(sd, 1))})"
+            aktuell = "–"
+        if ist_zahl(z["ergebnis3"]):
+            ex3 = f"{datum(z['ausstieg3_datum'])}: {pct_farbig(z['ergebnis3'])}"
+        else:
+            ex3 = f"ca. {datum(tag_plus(sd, 3))}"
+        ex5 = f"ca. {datum(tag_plus(sd, 5))}"
+        zeilen.append([e(z["ticker"]), datum(sd), einstieg, aktuell, ex3, ex5])
+    teile.append(tabelle(["Aktie", "Signal", "Einstieg", "Stand (brutto)", "Ausstieg 3 Tage",
+                          "Ausstieg 5 Tage"], zeilen, "Keine offenen Positionen."))
+    return "".join(teile)
+
+
+def _stat(df: pd.DataFrame, spalte: str):
+    r = df[spalte].dropna()
+    if r.empty:
+        return 0, np.nan, np.nan, np.nan
+    return len(r), r.mean(), r.median(), (r > 0).mean()
+
+
+def bilanz_abschnitt(journal_df: pd.DataFrame) -> str:
+    teile = ["<h2>Bilanz des Journals (nach Kosten)</h2>"]
+    if journal_df.empty:
+        teile.append('<p class="muted">Das Journal ist noch leer. Die Bilanz erscheint, sobald die ersten '
+                     'Trades abgeschlossen sind.</p>')
+        return "".join(teile)
+    offen = int(journal_df["ausstieg5_datum"].isna().sum())
+    kacheln = [kachel("Trades gesamt", str(len(journal_df))), kachel("Noch offen", str(offen))]
+    for h, spalte in ((3, "ergebnis3"), (5, "ergebnis5")):
+        n, mean, median, treffer = _stat(journal_df, spalte)
+        kacheln.append(kachel(f"{h} Tage: abgeschlossen", str(n),
+                              f"Ø {pct(mean)} · Treffer {treffer:.0%}" if n else "noch keine"))
+    teile.append(f'<div class="kacheln">{"".join(kacheln)}</div>')
+    n3 = _stat(journal_df, "ergebnis3")[0]
+    if n3 < 30:
+        teile.append(f'<p class="banner small">Erst {n3} abgeschlossene Trades. Ab etwa 30 wird die '
+                     'Bilanz aussagekräftig, vorher sagt sie wenig.</p>')
+    fertig = journal_df[journal_df["ergebnis3"].notna()].sort_values("signal_datum", ascending=False).head(20)
+    zeilen = [[datum(z["signal_datum"]), e(z["ticker"]), pct(z["gap"], 1),
+               pct_farbig(z["ergebnis3"]), pct_farbig(z["ergebnis5"])] for _, z in fertig.iterrows()]
+    teile.append("<h3>Letzte abgeschlossene Trades</h3>")
+    teile.append(tabelle(["Signal", "Aktie", "Lücke", "Ergebnis 3 Tage", "Ergebnis 5 Tage"], zeilen,
+                         "Noch keine abgeschlossenen Trades."))
+    return "".join(teile)
+
+
+def haltedauer_abschnitt(erg, stand) -> str:
+    teile = ["<h2>Wie lange halten? (Backtest der Regel)</h2>"]
+    belege = gap_belege(erg)
+    if not belege:
+        teile.append('<p class="muted">Backtest-Ergebnisse nicht verfügbar.</p>')
+        return "".join(teile)
+    zeilen = []
+    for h in sorted(belege):
+        b = belege[h]
+        ok = bool(b.get("streng", False))
+        zeilen.append([f"{h} Handelstag(e)", f"{int(b['n'])}", pct(b["mean_netto"]), f"{b['treffer']:.0%}",
+                       pct(b["fall5"]), pct(b["vorsprung"]), f"{b['t']:.1f}",
+                       badge("bestanden" if ok else "nicht bestanden", "ok" if ok else "no")])
+    teile.append(tabelle(["Haltedauer", "Fälle", "Ø nach Kosten", "Treffer", "Schlechte 5 %",
+                          "Vorsprung zur Basis", "t-Wert", "Strenger Test"], zeilen))
+    teile.append('<p class="muted small">Regel: Aktie mit Kurslücke ab +3 % und mindestens doppeltem '
+                 'Volumen, Kauf zur nächsten Eröffnung. „Vorsprung“ ist der Unterschied zu einem '
+                 'beliebigen Tag. Stunden-Handel (z. B. 2 Stunden) lässt sich mit kostenlosen '
+                 'Tagesdaten nicht seriös testen und ist hier nicht abgedeckt. '
+                 f'Backtest zuletzt berechnet am {datum(stand)}.</p>')
+    return "".join(teile)
+
+
+def backtest_gesamt_abschnitt(erg) -> str:
+    if erg is None or erg.empty:
+        return ""
+    zeilen = []
+    for _, z in erg.iterrows():
+        ok = bool(z.get("streng", False))
+        zeilen.append([e(z["klasse"]), e(z["variante"]), f"{int(z['h'])} T", f"{int(z['n'])}",
+                       pct(z["mean_netto"]), f"{z['treffer']:.0%}", pct(z["vorsprung"]),
+                       f"{z['t']:.1f}" if ist_zahl(z["t"]) else "–",
+                       badge("bestanden" if ok else "nein", "ok" if ok else "neutral")])
+    return ("<details><summary>Alle Backtest-Ergebnisse (Aktien, Krypto, Rohstoffe)</summary>"
+            + tabelle(["Gruppe", "Variante", "Halten", "Fälle", "Ø netto", "Treffer", "Vorsprung",
+                       "t", "Test"], zeilen) + "</details>")
+
+
+def scan_abschnitt(scan_tab, erg) -> str:
+    teile = ["<h2>Marktscan: alle Werte (Aktien, Krypto, Rohstoffe)</h2>",
+             '<p class="muted small">Auffälligkeiten auf der letzten Tageskerze. Nur was im Backtest '
+             'bestätigt ist, gilt als Signal. Alles andere ist reine Information.</p>']
+    if scan_tab is None or scan_tab.empty:
+        teile.append('<p class="muted">Scan heute nicht verfügbar.</p>')
+        return "".join(teile)
+    kand = scan_tab[scan_tab["setups"].map(len) > 0].sort_values("vol_ratio", ascending=False)
+    teile.append(f'<p class="small">Geprüft: {len(scan_tab)} Werte · mit Auffälligkeit: {len(kand)}</p>')
+    zeilen = []
+    for _, z in kand.head(60).iterrows():
+        klasse = klasse_von_gruppe(z["gruppe"])
+        for s in z["setups"]:
+            ok = bestaetigte_varianten(erg, klasse, s, z["gap"])
+            status = badge("im Backtest bestätigt", "ok") if ok else badge("nur Information", "neutral")
+            zeilen.append([e(z["ticker"]), e(str(z["name"])[:26]), e(klasse), e(s),
+                           f"{z['close']:.2f}", pct_farbig(z["ret_1d"], 1), pct_farbig(z["ret_5d"], 1),
+                           f"{z['rsi']:.0f}", f"×{z['vol_ratio']:.1f}", status])
+    teile.append(tabelle(["Wert", "Name", "Gruppe", "Auffälligkeit", "Kurs", "1 Tag", "5 Tage", "RSI",
+                          "Volumen", "Status"], zeilen, "Heute keine Auffälligkeiten."))
+    return "".join(teile)
+
+
+def status_abschnitt(status: dict) -> str:
+    zeilen = [[e(k), e(v)] for k, v in status.items()]
+    return "<h2>Systemstatus</h2>" + tabelle(["Punkt", "Wert"], zeilen)
+
+
+# ---------- Gesamtseite ----------
+def baue_seite(stand: datetime, signale: list[dict], neue_tickers: set, journal_df: pd.DataFrame,
+               letzte_kurse: dict, scan_tab, erg, backtest_stand, status: dict) -> str:
+    kopf = (
+        '<!doctype html><html lang="de"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        '<meta name="robots" content="noindex, nofollow">'
+        '<meta http-equiv="refresh" content="1800">'
+        '<meta name="apple-mobile-web-app-title" content="Journal">'
+        f"<title>Trading-Journal</title><style>{CSS}</style></head><body><div class=\"wrap\">"
+    )
+    banner = (
+        '<div class="banner"><b>Paper-Trading:</b> Hier wird nichts gekauft. Nur die Regel '
+        '„Kurslücke nach oben mit hohem Volumen“ (Aktien, Halten 3 bis 5 Handelstage) hat den '
+        'Backtest bestanden. Alles andere ist reine Information. Das ist keine Anlageberatung, '
+        'und Verluste sind jederzeit möglich.</div>'
+    )
+    titel = (f'<h1>Trading-Journal</h1><div class="muted small">Stand: {stand.strftime("%d.%m.%Y %H:%M")} '
+             '(Berlin) · aktualisiert an Börsentagen morgens</div>')
+    ende = "</div></body></html>"
+    return "".join([
+        kopf, titel, banner,
+        heute_abschnitt(signale, neue_tickers, erg),
+        offene_abschnitt(journal_df, letzte_kurse),
+        bilanz_abschnitt(journal_df),
+        haltedauer_abschnitt(erg, backtest_stand),
+        backtest_gesamt_abschnitt(erg),
+        scan_abschnitt(scan_tab, erg),
+        status_abschnitt(status),
+        ende,
+    ])
