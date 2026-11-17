@@ -1,1 +1,2 @@
 id,ticker,name,gruppe,signal_datum,signal_close,gap,vol_ratio,einstieg_datum,einstieg_preis,ausstieg3_datum,ausstieg3_preis,ergebnis3,ausstieg5_datum,ausstieg5_preis,ergebnis5,angelegt
+1,TSN,Tyson Foods,SP500,2026-11-16,63.95000076293945,0.035362153040570554,2.223801735900294,,,,,,,,,2026-11-17
